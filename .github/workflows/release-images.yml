@@ -1,0 +1,157 @@
+name: Publish release images
+
+# Publishing a release tests its tag and publishes the Docker images to Docker Hub right away:
+#   <image>:<version> and <image>:sha-<commit> for every release,
+#   <image>:acc for every release (the acceptance environment),
+#   <image>:prod only for a release that is not marked as a pre-release.
+# Run this workflow by hand with a tag when the build after publishing failed, for example on a runner outage.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag to build the images for, for example v1.4.0'
+        type: string
+        required: true
+
+concurrency:
+  group: release-images-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+      prerelease: ${{ steps.select.outputs.prerelease }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Require a published release
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag is not a supported semantic version: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '[.draft, .prerelease] | @tsv' || true)"
+          draft="$(cut -f1 <<< "$release")"
+          prerelease="$(cut -f2 <<< "$release")"
+          if [[ "$draft" != "false" ]]; then
+            echo "No published release exists for tag $RELEASE_TAG." >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.select.outputs.tag }}
+
+      - name: Validate release
+        id: release
+        env:
+          RELEASE_TAG: ${{ steps.select.outputs.tag }}
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+
+          # Only code that reached main is published as a release image.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "Release $RELEASE_TAG points at $commit, which is not on main. Publish releases from main only." >&2
+            exit 1
+          fi
+
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "commit=$commit"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  integration:
+    name: Continuous integration
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/continuous-integration.yml
+    # The publish job builds every image after the tests pass, so CI does not build them a second time.
+    with:
+      skip-docker-build: true
+      ref: ${{ needs.version.outputs.tag }}
+
+  publish:
+    name: Publish ${{ matrix.image }} image
+    needs:
+      - integration
+      - version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.integration.outputs.docker) }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: true
+          tags: |
+            ${{ matrix.image }}:acc
+            ${{ matrix.image }}:${{ needs.version.outputs.version }}
+            ${{ matrix.image }}:sha-${{ needs.version.outputs.commit }}
+            ${{ needs.version.outputs.prerelease != 'true' && format('{0}:prod', matrix.image) || '' }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.version.outputs.commit }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          # The frontend shows this version as its client version.
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.version }}
+
+      - name: Add image summary
+        env:
+          IMAGE: ${{ matrix.image }}:${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          {
+            echo "## Published \`$IMAGE\`"
+            echo
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo "Tagged \`acc\` only: the release is a pre-release, so \`prod\` was not moved."
+            else
+              echo "Tagged \`acc\` and \`prod\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

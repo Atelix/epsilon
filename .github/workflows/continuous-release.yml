@@ -1,124 +1,55 @@
-name: Continuous Release
+name: Prepare release draft
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
-permissions: write-all
+concurrency:
+  group: release-draft-main
+  cancel-in-progress: false
 
-env:
-  REGISTRY: ghcr.io
-  GH_TOKEN: ${{ github.token }}
+permissions:
+  contents: read
 
 jobs:
-  change-validation:
-    name: Validate changes for new release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Get latest release
-        id: latest_release
-        run: echo "LATEST_RELEASE=$(gh release list --json tagName,publishedAt,isDraft -q='map(select(.isDraft == false)) |  sort_by(.publishedAt) | reverse[0]?.tagName')" >> $GITHUB_ENV
-      - name: Changes with main
-        run: |
-          git fetch origin main
-           git diff --name-only ${{ env.LATEST_RELEASE }}...HEAD > CHANGES
-           echo $CHANGES
-           if [ -s CHANGES ]; then
-             echo "CHANGES_FOUND=True" >> $GITHUB_ENV
-           else
-             echo "CHANGES_FOUND=False" >> $GITHUB_ENV
-           fi
-    outputs:
-      CHANGES: ${{ env.CHANGES_FOUND }}
-  integration:
-    if: ${{ needs.change-validation.outputs.CHANGES == 'True' }}
-    name: Continuous Integration
-    needs: [ change-validation ]
-    permissions:
-      pull-requests: write
-      actions: read
-      contents: read
-      security-events: write
-    uses: ./.github/workflows/continuous-integration.yml
-  
-  publish-release:
-    name: Publish release
-    if: ${{ needs.change-validation.outputs.CHANGES == 'True' }}
+  draft:
+    name: Update release draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: write
-      pull-requests: write
-    runs-on: ubuntu-latest
-    needs: [ change-validation, integration ]
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v6
+      - name: Calculate and update draft release
+        id: release-drafter
+        uses: release-drafter/release-drafter@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
         with:
-          fetch-depth: 0
-      - name: Define release type
-        run: echo "IS_PRERELEASE=$(gh pr list -B main -l beta -s merged --json mergedAt -q='map(select((now | strftime("%s")|tonumber) - (.mergedAt | fromdate | strftime("%s")|tonumber) <= 86400)) | length > 0')" >> $GITHUB_ENV
-      - uses: release-drafter/release-drafter@v6.1.0
-        id: releaser
-        with:
-          prerelease-identifier: 'beta'
-          publish: true
-          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Setup node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-      - name: Set version
-        run: |
-          cd ${{needs.integration.outputs.frontend}}
-          npm version ${{ steps.releaser.outputs.tag_name }} --git-tag-version false -f --allow-same-version true
-      - name: force update major tag
-        run: |
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "Github action"
-          git add ${{needs.integration.outputs.frontend}}/package.json
-          git commit -m "Bump package.json version to ${{ steps.releaser.outputs.tag_name }}"
-          git tag ${{ steps.releaser.outputs.tag_name }} -f
-          git push origin refs/tags/${{ steps.releaser.outputs.tag_name }} -f
-    outputs:
-      tag: ${{ steps.releaser.outputs.tag_name }}
-      isBeta: ${{ env.IS_PRERELEASE }}
-  
-  
-  deploy:
-    if: ${{ needs.change-validation.outputs.CHANGES == 'True' }}
-    name: Publish images to package registry
-    runs-on: ubuntu-latest
-    needs: [ change-validation, integration, publish-release ]
-    permissions: write-all
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{fromJson(needs.integration.outputs.docker)}}
-    
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.publish-release.outputs.tag }}
-        name: Check out code
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          push: true
-          file: ${{ matrix.file }}
-          tags: |
-            ${{ matrix.image }}:acc
-            ${{ matrix.image }}:${{ needs.publish-release.outputs.tag }}
-            ${{ needs.publish-release.outputs.isBeta != 'true' && format('{0}:prod', matrix.image) || '' }}
+      - name: Validate draft version
+        env:
+          RELEASE_TAG: ${{ steps.release-drafter.outputs.tag_name }}
+          RESOLVED_VERSION: ${{ steps.release-drafter.outputs.resolved_version }}
+        shell: bash
+        run: |
+          if [[ ! "$RESOLVED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release Drafter returned an invalid semantic version: $RESOLVED_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_TAG" != "v$RESOLVED_VERSION" ]]; then
+            echo "Release tag $RELEASE_TAG does not match version v$RESOLVED_VERSION" >&2
+            exit 1
+          fi
+
+          {
+            echo "## Draft release $RELEASE_TAG"
+            echo
+            echo "The draft remains unpublished until it is manually published."
+            echo "Publishing creates the Git tag and publishes the Docker images to Docker Hub right away."
+            echo "Tick \"Set as a pre-release\" to publish only the version and acceptance (acc) tags, without the prod tag."
+          } >> "$GITHUB_STEP_SUMMARY"
